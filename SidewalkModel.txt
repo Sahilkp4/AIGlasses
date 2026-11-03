@@ -1,0 +1,8 @@
+from transformers import pipeline
+
+pipe = pipeline("image-segmentation", model="tobiasc/segformer-b0-finetuned-segments-sidewalk")
+
+from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
+
+processor = AutoImageProcessor.from_pretrained("tobiasc/segformer-b0-finetuned-segments-sidewalk")
+model = SegformerForSemanticSegmentation.from_pretrained("tobiasc/segformer-b0-finetuned-segments-sidewalk", device_map="auto")
