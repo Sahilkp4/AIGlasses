@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
 
-SRC = "dataset_flip"
+SRC = "data/dataset_flip"
 OUT = "runs/sidewalk_eval"
 MODEL = "tobiasc/segformer-b0-finetuned-segments-sidewalk"
 EVAL_W, EVAL_H = 960, 540

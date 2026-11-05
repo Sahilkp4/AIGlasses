@@ -1,0 +1,5 @@
+data/
+runs/
+dataset_flip.7z
+.DS_Store
+__pycache__/
