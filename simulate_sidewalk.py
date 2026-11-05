@@ -9,12 +9,14 @@ Scores (sidewalk pixels at 960x540, ground truth from eval_sidewalk.gt_mask):
              drops count; frames before the first result score as an empty prediction)
   processed  each processed frame against its own labels (no lag)
   baseline   raw model argmax sidewalk (as in eval_sidewalk.py) on the same processed frames, computed offline
-The prediction scored is the focus area (with --sobel, the focus area after the Sobel texture check). Also: focus-area coverage of the near-field sidewalk, latency and drops.
+The prediction scored is the focus area after the Sobel and GMM checks, which are on by default. Also: focus-area coverage of the near-field sidewalk, latency and drops.
 
   python3 simulate_sidewalk.py --limit 60      # smoke test
   python3 simulate_sidewalk.py --video         # full run with overlay videos
   python3 simulate_sidewalk.py --walks A --video   # originals only: walk B just mirrors them
-  python3 simulate_sidewalk.py --walks A --sobel --out runs/sidewalk_sobel   # score the Sobel-refined focus area
+  python3 simulate_sidewalk.py --walks A --no-gmm --out runs/sidewalk_sobel   # score the Sobel-refined focus area
+  python3 simulate_sidewalk.py --walks A --no-sobel --out runs/sidewalk_gmm   # score the GMM-refined focus area
+  python3 simulate_sidewalk.py --walks A --no-sobel --no-gmm --out runs/sidewalk_focus   # score the plain focus area
 """
 import argparse
 import csv
@@ -28,7 +30,9 @@ import numpy as np
 import torch
 from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
 
+import gmm_color
 from eval_sidewalk import EVAL_H, EVAL_W, MODEL, gt_mask
+from gmm_color import BOTH_REJECTED_COLOR, COLOR_REJECTED_COLOR, GmmColor
 from sidewalk_system import SidewalkNavigator
 from sobel_texture import REJECTED_COLOR, THRESHOLD, WINDOW, SobelTexture
 
@@ -42,7 +46,8 @@ BASELINE_BATCH = 8
 CORRECT_COLOR = (0, 200, 0)
 UNLABELLED_COLOR = (0, 0, 230)
 MISSED_COLOR = (230, 120, 0)
-HEADER_H = 74
+HEADER_H = 94
+LEGEND_ROW_H = 20
 
 
 class Camera:
@@ -79,7 +84,9 @@ def run_live(nav, frames, fps):
         r["mask"] = np.packbits(r.get("refined_focus", r["focus"]))
         if "anomaly" in r:
             r["rejected"] = np.packbits(r["anomaly"])
-        for k in ("focus", "sidewalk", "anomaly", "refined_sidewalk", "refined_focus"):
+        if "color_anomaly" in r:
+            r["color_rejected"] = np.packbits(r["color_anomaly"])
+        for k in ("focus", "sidewalk", "anomaly", "color_anomaly", "refined_sidewalk", "refined_focus"):
             r.pop(k, None)
         results.append(r)
         last = idx
@@ -139,9 +146,12 @@ def text(img, s, org, scale=0.5, color=(255, 255, 255)):
 def legend(img, items, y):
     x = 10
     for label, color in items:
+        width = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0]
+        if x + 17 + width > img.shape[1]:
+            x, y = 10, y + LEGEND_ROW_H
         cv2.rectangle(img, (x, y - 11), (x + 12, y + 1), color, -1)
         text(img, label, (x + 17, y), 0.45)
-        x += 37 + cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0]
+        x += 37 + width
 
 
 def render(frames, gts, live, results, fps, path, walk):
@@ -150,6 +160,10 @@ def render(frames, gts, live, results, fps, path, walk):
              ("labelled sidewalk, missed", MISSED_COLOR)]
     if "rejected" in results[0]:
         items.append(("rejected by Sobel", REJECTED_COLOR))
+    if "color_rejected" in results[0]:
+        items.append(("rejected by GMM", COLOR_REJECTED_COLOR))
+    if "rejected" in results[0] and "color_rejected" in results[0]:
+        items.append(("rejected by both", BOTH_REJECTED_COLOR))
     writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"avc1"), fps, (EVAL_W, EVAL_H))
     for i, img in enumerate(frames):
         k = live[i]
@@ -162,8 +176,11 @@ def render(frames, gts, live, results, fps, path, walk):
             ov[pred & ~gt] = UNLABELLED_COLOR
             ov[~pred & gt] = MISSED_COLOR
             out = cv2.addWeighted(out, 0.6, ov, 0.4, 0)
-            if "rejected" in r:
-                out[unpack(r["rejected"])] = REJECTED_COLOR
+            sobel = unpack(r["rejected"]) if "rejected" in r else np.zeros_like(pred)
+            gmm = unpack(r["color_rejected"]) if "color_rejected" in r else np.zeros_like(pred)
+            out[sobel] = REJECTED_COLOR
+            out[gmm] = COLOR_REJECTED_COLOR
+            out[sobel & gmm] = BOTH_REJECTED_COLOR
             age = 1000 * (max(r["end"], i / fps) - r["frame"] / fps)
             line1 = f"focus {100 * pred.mean():.1f}% of frame  latency {r['latency_ms']:.0f} ms"
             line2 = f"from frame {r['frame'] + 1}  age {age:.0f} ms"
@@ -234,6 +251,9 @@ def evaluate_walk(name, frames, gts, results, fps, device, video, out):
     if "sobel_ms" in results[0]:
         sobel = np.array([r["sobel_ms"] for r in results])
         summary["sobel_ms"] = {"mean": round(sobel.mean(), 2), "p95": round(np.percentile(sobel, 95), 2)}
+    if "gmm_ms" in results[0]:
+        gmm = np.array([r["gmm_ms"] for r in results])
+        summary["gmm_ms"] = {"mean": round(gmm.mean(), 2), "p95": round(np.percentile(gmm, 95), 2)}
     return summary, rows
 
 
@@ -245,9 +265,12 @@ def main():
     ap.add_argument("--video", action="store_true")
     ap.add_argument("--walks", default="AB", help="walks to run: A (frames 1-600), B (mirrored 601-1200) or AB")
     ap.add_argument("--out", default=OUT, help="output directory")
-    ap.add_argument("--sobel", action="store_true", help="score the focus area after the Sobel texture check")
-    ap.add_argument("--sobel-window", type=int, default=WINDOW, help="sliding-window size in pixels, odd")
-    ap.add_argument("--sobel-threshold", type=float, default=THRESHOLD, help="reference SDs before a pixel is rejected")
+    ap.add_argument("--sobel", action=argparse.BooleanOptionalAction, default=True, help="run the Sobel texture check")
+    ap.add_argument("--sobel-window", type=int, nargs=2, default=WINDOW, metavar=("W", "H"), help="sliding-window width and height in pixels, odd")
+    ap.add_argument("--sobel-threshold", type=float, default=THRESHOLD, help="spreads above normal texture before a pixel is rejected")
+    ap.add_argument("--gmm", action=argparse.BooleanOptionalAction, default=True, help="run the GMM colour check")
+    ap.add_argument("--gmm-window", type=int, default=gmm_color.WINDOW, help="sliding-window size in pixels, odd")
+    ap.add_argument("--gmm-threshold", type=float, default=gmm_color.THRESHOLD, help="SDs from every component before a pixel is rejected")
     args = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
@@ -257,7 +280,8 @@ def main():
     gts_all = load_gt(paths)
     walks = {k: v for k, v in {"A": range(0, N_ORIGINAL), "B": range(N_ORIGINAL, len(paths))}.items()
              if k in args.walks.upper()}
-    nav = SidewalkNavigator(args.device, SobelTexture(args.sobel_window, args.sobel_threshold) if args.sobel else None)
+    nav = SidewalkNavigator(args.device, SobelTexture(args.sobel_window, args.sobel_threshold) if args.sobel else None,
+                            GmmColor(args.gmm_window, args.gmm_threshold) if args.gmm else None)
 
     summaries, all_rows = {}, []
     for name, rng in walks.items():
@@ -291,6 +315,8 @@ def main():
         print(f"  focus covers {100 * s['focus_coverage_near_field']:.1f}% of near-field sidewalk")
         if "sobel_ms" in s:
             print(f"  sobel mean {s['sobel_ms']['mean']} ms p95 {s['sobel_ms']['p95']} ms")
+        if "gmm_ms" in s:
+            print(f"  gmm mean {s['gmm_ms']['mean']} ms p95 {s['gmm_ms']['p95']} ms")
     print(f"\nOutputs in {args.out}/ (summary.json, per_frame.csv{', overlay_walk*.mp4' if args.video else ''})")
 
 
