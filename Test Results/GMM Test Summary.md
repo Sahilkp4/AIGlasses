@@ -1,5 +1,7 @@
 # GMM Sidewalk Irregularity Tests: Summary
 
+> **RETIRED (November 8, 2026).** The GMM method is retired from the full model. This page covers the first GMM (November 3-4). A second, per-frame GMM colour check was built afterwards (`GMM Color Test Summary.md`). It has now also been replaced, by the median/MAD colour difference check in `color_difference.py`. That check matched the GMM's mask accuracy at about 1/20 of the cost; see `Color Difference Test Summary.md`. The GMM code is kept only for reference, as `gmm_color_RETIRED.py` and `eval_gmm_RETIRED.py`. Nothing in the pipeline imports it.
+
 **Date:** November 3-4, 2026
 **Outcome:** The GMM is considered a failure for now and has been removed from the code. The focus area is a success and stays.
 

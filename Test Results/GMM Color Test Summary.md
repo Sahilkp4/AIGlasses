@@ -1,5 +1,7 @@
 # GMM Colour Check Tests: Summary
 
+> **RETIRED (November 8, 2026).** This GMM colour check is retired from the full model. It was replaced by the median/MAD colour difference check in `color_difference.py`. On all 600 frames, with Sobel on, the replacement scored 0.650 IoU against the GMM's 0.648, with 47.7 ms mean latency against 69.9 ms and about 1/9 of the CPU. It catches somewhat less of the cone and racks. See `Color Difference Test Summary.md`. The code is kept for reference as `gmm_color_RETIRED.py`, with its sweep in `eval_gmm_RETIRED.py`.
+
 **Date:** November 5, 2026
 **Outcome:** Promising for coloured objects, not proven. The stage catches most of the cone and racks that SegFormer leaves in the focus area, and it barely lowers mask accuracy. The Sobel and GMM checks were turned on by default after these tests. It still misses the racks on some frames, flags dark ground under cars, and cannot see potholes or manhole covers.
 

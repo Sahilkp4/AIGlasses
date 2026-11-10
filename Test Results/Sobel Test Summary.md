@@ -1,5 +1,7 @@
 # Sobel Sidewalk Texture Tests: Summary
 
+> **Note (November 8, 2026):** The GMM colour check mentioned below is retired. Sobel now runs alongside the colour difference check (`color_difference.py`). Since that update, Sobel also scores the holes inside the focus area, and its reference still uses sidewalk pixels only. Its results on focus pixels are unchanged. See `Color Difference Test Summary.md`.
+
 **Date:** November 4-5, 2026
 **Outcome:** Promising, and now on by default with the GMM. A redesigned stage, Log 31x5, replaced the first design. On all 600 frames of walk A it cut false flags from 5.24% to 2.78% and far false flags from 14.07% to 4.72%, and it caught more of the pothole, manhole rim, racks and a sidewalk fault. It catches less of the cone, adds long thin false streaks, and is untested on cracks running along the path.
 

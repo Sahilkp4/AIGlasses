@@ -1,4 +1,7 @@
-"""Sweep the GMM colour check over window and threshold on walk A, scored against hand-outlined targets.
+"""RETIRED with the GMM colour check (November 8, 2026); kept only to reproduce the GMM results. The live colour check
+is color_difference.py, evaluated by eval_color_difference.py.
+
+Sweep the GMM colour check over window and threshold on walk A, scored against hand-outlined targets.
 
 SegFormer runs once per frame; only the colour check is repeated. Scores:
   catch        share of a target's pixels left in the focus area that were flagged (targets in gmm_targets.json)
@@ -17,36 +20,14 @@ import os
 import cv2
 import numpy as np
 
-from eval_sidewalk import EVAL_H, EVAL_W, gt_mask
-from gmm_color import GmmColor, ab_features
+from eval_sidewalk import gt_mask
+from eval_targets import NOT_CLEAN, TARGETS, load, target_masks
+from gmm_color_RETIRED import GmmColor
 from sidewalk_system import SidewalkNavigator
 from simulate_sidewalk import FPS, N_ORIGINAL, SRC
 
-TARGETS = "gmm_targets.json"
 OUT = "runs/gmm_eval"
 CLEAN_STEP = 5
-NOT_CLEAN = (range(125, 141), range(440, 481))  # the labels call the cone and racks sidewalk here
-RACK_MIN_B = 150  # OpenCV 8-bit Lab: rack outlines are loose, so only clearly yellow pixels count as rack
-
-
-def load(i):
-    return cv2.resize(cv2.imread(f"{SRC}/{i:06d}.jpg", cv2.IMREAD_REDUCED_COLOR_4), (EVAL_W, EVAL_H))
-
-
-def fill(polygons):
-    mask = np.zeros((EVAL_H, EVAL_W), np.uint8)
-    cv2.fillPoly(mask, [np.array(p, np.int32) for p in polygons], 1)
-    return mask.astype(bool)
-
-
-def target_masks(targets, i, frame):
-    """Masks of the targets outlined on frame i. The cone stands in the pothole, so it is cut out of it."""
-    out = {name: fill(frames[str(i)]) for name, frames in targets.items() if str(i) in frames}
-    if "rack" in out:
-        out["rack"] &= ab_features(frame)[:, :, 1] >= RACK_MIN_B
-    if "pothole" in out and "cone" in out:
-        out["pothole"] &= ~out["cone"]
-    return out
 
 
 def main():

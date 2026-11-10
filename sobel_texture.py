@@ -2,7 +2,8 @@
 
 A second stage after segmentation, not a replacement. The reference is learned per frame from the focus area itself,
 so it needs no labels and no state between frames. Input masks are never changed: rejected pixels only leave the
-separate refined masks.
+separate refined masks. Holes in the focus area (non-sidewalk regions it fully encloses) are scored too, so objects
+SegFormer cut out can still be flagged, but only sidewalk-labelled pixels feed the reference.
 
 Sobel runs on log brightness, so dark ground is not scored lower for being dark. Texture is averaged over focus pixels
 only, so kerbs and cars do not leak into windows at the focus edge. Normal texture is a smooth curve over image rows:
@@ -36,6 +37,13 @@ KEPT_COLOR = (0, 200, 0)
 REJECTED_COLOR = (255, 0, 255)
 
 
+def fill_holes(mask):
+    """mask plus every region it fully encloses (4-connected background not reachable from the border)."""
+    flood = np.pad(mask.astype(np.uint8), 1)  # the padding joins all border background, so the seed reaches it
+    cv2.floodFill(flood, None, (0, 0), 1)
+    return (flood[1:-1, 1:-1] == 0) | mask.astype(bool)
+
+
 def gradient_magnitude(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     log = (np.log1p(gray.astype(np.float32)) * LOG_SCALE).astype(np.float32)
@@ -52,11 +60,11 @@ class SobelTexture:
             raise ValueError(f"threshold must be positive, got {threshold}")
         self.window, self.threshold = tuple(window), threshold
 
-    def _texture(self, frame, focus):
-        """Log of the windowed edge strength, averaged over focus pixels only."""
-        inside = cv2.erode(focus.astype(np.uint8), np.ones((EDGE_ERODE, EDGE_ERODE), np.uint8)).astype(np.float32)
+    def _texture(self, gradient, region):
+        """Log of the windowed edge strength, averaged over the pixels of region only."""
+        inside = cv2.erode(region.astype(np.uint8), np.ones((EDGE_ERODE, EDGE_ERODE), np.uint8)).astype(np.float32)
         weight = np.maximum(cv2.blur(inside, self.window), MIN_WEIGHT)
-        return np.log1p(cv2.blur(gradient_magnitude(frame) * inside, self.window) / weight)
+        return np.log1p(cv2.blur(gradient * inside, self.window) / weight)
 
     @staticmethod
     def _reference(texture, focus, top):
@@ -87,7 +95,11 @@ class SobelTexture:
         return {"normal": normal, "spread": np.maximum(spread, MIN_SPREAD), "bands": len(centres), "px": int(sample.size)}
 
     def verify(self, frame, sidewalk, focus):
-        """frame: BGR image; sidewalk, focus: boolean masks. Returns the anomaly mask and the refined masks."""
+        """frame: BGR image; sidewalk, focus: boolean masks. Returns the anomaly mask and the refined masks.
+
+        The focus area and the holes it encloses are scored. Focus pixels, and the reference built from them, use
+        texture averaged over sidewalk-labelled focus pixels alone, so nothing in a hole reaches them; only hole pixels
+        average over the filled area."""
         t0 = time.perf_counter()
         anomaly, reference = np.zeros_like(focus), None
         x, y, w, h = cv2.boundingRect(focus.astype(np.uint8))
@@ -96,11 +108,17 @@ class SobelTexture:
             x0, y0 = max(x - margin_x, 0), max(y - margin_y, 0)
             x1, y1 = min(x + w + margin_x, frame.shape[1]), min(y + h + margin_y, frame.shape[0])
             box = (slice(y0, y1), slice(x0, x1))
-            texture = self._texture(frame[box], focus[box])
-            reference = self._reference(texture, focus[box], y0)
+            labelled = focus[box] & sidewalk[box]
+            gradient = gradient_magnitude(frame[box])
+            texture = self._texture(gradient, labelled)
+            reference = self._reference(texture, labelled, y0)
             if reference is not None:
+                area = fill_holes(focus[box])
+                holes = area & ~labelled
+                if holes.any():  # hole pixels average over the filled area; focus pixels keep their focus-only texture
+                    texture[holes] = self._texture(gradient, area)[holes]
                 score = (texture - reference["normal"][:, None]) / reference["spread"][:, None]
-                anomaly[box] = focus[box] & (score > self.threshold)
+                anomaly[box] = area & (score > self.threshold)
         return {"anomaly": anomaly, "refined_sidewalk": sidewalk & ~anomaly, "refined_focus": focus & ~anomaly,
                 "reference": reference, "sobel_ms": round(1000 * (time.perf_counter() - t0), 2)}
 

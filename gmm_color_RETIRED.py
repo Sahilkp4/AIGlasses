@@ -1,8 +1,13 @@
-"""GMM colour check: flags focus-area pixels whose Lab a, b colour fits none of the frame's normal sidewalk colours.
+"""RETIRED (November 8, 2026): replaced in the full model by the median/MAD colour difference check in
+color_difference.py, which matched its mask accuracy at about 1/20 of the cost (see Test Results/Color Difference Test
+Summary.md). Nothing in the pipeline imports this module; it is kept only so eval_gmm_RETIRED.py can reproduce results.
+
+GMM colour check: flags focus-area pixels whose Lab a, b colour fits none of the frame's normal sidewalk colours.
 
 A second stage after segmentation, not a replacement. The GMM is learned per frame from the focus area itself, so it
 needs no labels and no state between frames. Input masks are never changed. L is left out, so brightness alone cannot
-flag a pixel, and only colour differences are found: potholes, manhole covers and grey objects are not.
+flag a pixel, and only colour differences are found: potholes, manhole covers and grey objects are not. Holes in the
+focus area (non-sidewalk regions it fully encloses) are scored too, but only sidewalk-labelled pixels feed the GMM.
 
 Tuning:
   WINDOW         Larger averages over more pavement: fewer flags on seams, but thin objects get diluted, and the
@@ -16,7 +21,7 @@ import time
 import cv2
 import numpy as np
 
-from sobel_texture import KEPT_COLOR, REJECTED_COLOR, _tile
+from sobel_texture import KEPT_COLOR, REJECTED_COLOR, _tile, fill_holes
 
 WINDOW = 9  # sliding-window size in pixels, odd
 THRESHOLD = 4.0  # NOT MATCH when the local colour is more than this many SDs from every kept component
@@ -62,9 +67,10 @@ class GmmColor:
         return (em.getMeans()[keep].astype(np.float32),
                 np.array([np.linalg.inv(covs[i] + MIN_SD ** 2 * np.eye(2)) for i in keep], np.float32))
 
-    def _reference(self, local, focus):
-        """GMM of the local colours deep inside the focus area, refitted without what it would reject itself."""
-        core = cv2.erode(focus.astype(np.uint8), np.ones((self.window, self.window), np.uint8)).astype(bool)
+    def _reference(self, local, labelled):
+        """GMM of the local colours deep inside the sidewalk-labelled focus area, refitted without what it would reject
+        itself. The erosion matches the blur, so no reference window reaches a non-sidewalk pixel."""
+        core = cv2.erode(labelled.astype(np.uint8), np.ones((self.window, self.window), np.uint8)).astype(bool)
         sample = local[core]
         if len(sample) < MIN_REFERENCE_PX:
             return None
@@ -88,10 +94,10 @@ class GmmColor:
             x1, y1 = min(x + w + margin, frame.shape[1]), min(y + h + margin, frame.shape[0])
             box = (slice(y0, y1), slice(x0, x1))
             local = cv2.blur(ab_features(frame[box]), (self.window, self.window))
-            reference = self._reference(local, focus[box])
+            reference = self._reference(local, focus[box] & sidewalk[box])
             if reference is not None:
                 differs = distance(local, reference["means"], reference["precisions"]) > self.threshold
-                anomaly[box] = focus[box] & differs
+                anomaly[box] = fill_holes(focus[box]) & differs  # holes are scored, but never feed the reference
                 n, lab, stats, _ = cv2.connectedComponentsWithStats(anomaly.astype(np.uint8), connectivity=8)
                 big = 1 + np.flatnonzero(stats[1:, cv2.CC_STAT_AREA] >= MIN_OBJECT_PX)
                 anomaly = np.isin(lab, big)
@@ -122,7 +128,7 @@ def debug_panel(frame, sidewalk, result):
         cv2.rectangle(highlight, (x, y), (x + bw, y + bh), COLOR_REJECTED_COLOR, 1)
 
     ref = result["color_reference"]
-    stats = f"{len(ref['means'])} components" if ref else "no reference"
+    stats = "no reference" if not ref else f"{len(ref['means'])} components" if "means" in ref else "median reference"
     title = "kept green, colour yellow" + (", Sobel magenta" if sobel is not None else "")
     top = np.hstack([_tile(paint(sidewalk, KEPT_COLOR), "original sidewalk", size),
                      _tile(paint(anomaly, COLOR_REJECTED_COLOR), f"colour anomalies ({stats})", size)])
