@@ -7,7 +7,8 @@ bilinear upsample is how SegFormer upsamples logits in training, and it is faste
 of the class map (eval_segformer_input.py). The focus mask itself never includes non-sidewalk pixels. The checks also score the holes it encloses, and learn their
 references from sidewalk pixels only; the refined masks are always the focus or sidewalk mask minus rejections.
 
-The Sobel texture check (sobel_texture.py) and the colour difference check (color_difference.py) are on by default.
+The Sobel texture check (sobel_texture.py) and the colour difference check (color_difference.py) are on by default,
+followed by feature tracking (feature_tracking.py), which links their flagged blobs across frames.
 The earlier GMM colour check is retired (gmm_color_RETIRED.py) and is not used.
 
   python3 sidewalk_system.py --source walk.mov        # JSON lines on stdout
@@ -15,6 +16,7 @@ The earlier GMM colour check is retired (gmm_color_RETIRED.py) and is not used.
   python3 sidewalk_system.py --source walk.mov --show           # show the debug panel
   python3 sidewalk_system.py --source walk.mov --debug-video panel.mp4
   python3 sidewalk_system.py --source walk.mov --no-sobel --no-color   # segmentation only
+  python3 sidewalk_system.py --source walk.mov --no-tracking --track-frames 3   # per-frame checks only
 """
 import argparse
 import json
@@ -28,6 +30,7 @@ from transformers import SegformerForSemanticSegmentation
 
 import color_difference
 from color_difference import ColorDifference
+from feature_tracking import add_tracking_args, draw_tracks, tracker
 from sobel_texture import THRESHOLD, WINDOW, SobelTexture, debug_panel
 
 MODEL = "tobiasc/segformer-b0-finetuned-segments-sidewalk"
@@ -35,6 +38,17 @@ SIDEWALK = ("flat-sidewalk", "flat-cyclinglane", "flat-parkingdriveway")
 MODEL_IN = 512
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
+
+
+LIVE_W = 960  # live frames wider than this are shrunk to it before processing
+
+
+def camera_frame(frame):
+    """A camera frame as the live loop hands it to the navigator: shrunk to LIVE_W wide with INTER_AREA if wider."""
+    h, w = frame.shape[:2]
+    if w > LIVE_W:
+        frame = cv2.resize(frame, (LIVE_W, round(LIVE_W * h / w)), interpolation=cv2.INTER_AREA)
+    return frame
 
 
 def add_color_args(ap):
@@ -52,9 +66,10 @@ def color_check(args):
 
 
 class SidewalkNavigator:
-    def __init__(self, device=None, sobel=None, color=None):
+    def __init__(self, device=None, sobel=None, color=None, tracker=None):
         self.sobel = sobel  # optional SobelTexture; None runs segmentation only
         self.color = color  # optional ColorDifference
+        self.tracker = tracker  # optional FeatureTracker; keeps state between frames
         self.device = device or ("mps" if torch.backends.mps.is_available() else "cpu")
         self.model = SegformerForSemanticSegmentation.from_pretrained(MODEL).to(self.device).eval()
         names = {v: int(k) for k, v in self.model.config.id2label.items()}
@@ -111,10 +126,12 @@ class SidewalkNavigator:
             return np.zeros_like(label)
         return lab == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
 
-    def process(self, frame):
+    def process(self, frame, frame_index=None):
         """frame: BGR image. Returns the sidewalk label mask, the focus area mask and the latency, plus the
-        SobelTexture.verify and ColorDifference.verify results for the stages that are on. The refined masks leave out
-        what any stage rejected. latency_ms includes both stages; timing_ms splits it by stage."""
+        SobelTexture.verify, ColorDifference.verify and FeatureTracker.update results for the stages that are on. The
+        refined masks leave out what any stage rejected; with tracking on, that is the tracker's tracked_anomaly.
+        frame_index (camera frame number) lets the tracker scale its motion over dropped frames. latency_ms includes
+        every stage; timing_ms splits it by stage."""
         t0 = time.perf_counter()
         timing = {}
         sidewalk = self.segment(frame, timing)
@@ -130,6 +147,19 @@ class SidewalkNavigator:
             t = time.perf_counter()
             out.update(self.color.verify(frame, sidewalk, focus))
             timing["color_ms"] = 1000 * (time.perf_counter() - t)
+        if self.tracker and (self.sobel or self.color):
+            t = time.perf_counter()
+            flagged = np.zeros_like(focus)
+            for k in ("anomaly", "color_anomaly"):
+                if k in out:
+                    flagged |= out[k]
+            out.update(self.tracker.update(sidewalk, focus, flagged, frame_index))
+            timing["tracking_ms"] = 1000 * (time.perf_counter() - t)
+            t = time.perf_counter()
+            rejected = out["tracked_anomaly"]
+            out.update({"refined_sidewalk": sidewalk & ~rejected, "refined_focus": focus & ~rejected})
+            timing["refine_ms"] = 1000 * (time.perf_counter() - t)
+        elif self.color:
             t = time.perf_counter()
             rejected = out["color_anomaly"] | out["anomaly"] if self.sobel else out["color_anomaly"]
             out.update({"refined_sidewalk": sidewalk & ~rejected, "refined_focus": focus & ~rejected})
@@ -147,13 +177,14 @@ def main():
     ap.add_argument("--sobel-window", type=int, nargs=2, default=WINDOW, metavar=("W", "H"), help="sliding-window width and height in pixels, odd")
     ap.add_argument("--sobel-threshold", type=float, default=THRESHOLD, help="spreads above normal texture before a pixel is rejected")
     add_color_args(ap)
+    add_tracking_args(ap)
     ap.add_argument("--show", action="store_true", help="show the debug panel live, q quits (needs --sobel or --color)")
     ap.add_argument("--debug-video", help="write the debug panel to this mp4 (needs --sobel or --color)")
     args = ap.parse_args()
     if (args.show or args.debug_video) and not (args.sobel or args.color):
         ap.error("--show and --debug-video need --sobel or --color")
     nav = SidewalkNavigator(args.device, SobelTexture(args.sobel_window, args.sobel_threshold) if args.sobel else None,
-                            color_check(args))
+                            color_check(args), tracker(args))
     writer = None
     cap = cv2.VideoCapture(int(args.source) if args.source.isdigit() else args.source)
     i = 0
@@ -161,19 +192,24 @@ def main():
         ok, frame = cap.read()
         if not ok:
             break
-        h, w = frame.shape[:2]
-        if w > 960:
-            frame = cv2.resize(frame, (960, round(960 * h / w)), interpolation=cv2.INTER_AREA)
-        r = nav.process(frame)
+        frame = camera_frame(frame)
+        r = nav.process(frame, i)
         line = {"frame": i, "focus_frac": round(float(r["focus"].mean()), 3), "latency_ms": r["latency_ms"]}
         if args.sobel:
             line.update({"anomaly_frac": round(float(r["anomaly"].mean()), 3), "sobel_ms": r["sobel_ms"]})
         if args.color:
             line.update({"color_frac": round(float(r["color_anomaly"].mean()), 3),
                          "color_objects": len(r["color_objects"]), "color_ms": r["color_ms"]})
+        if "tracks" in r:
+            line.update({"tracks": len(r["tracks"]), "guaranteed": sum(t["state"] == "guaranteed" for t in r["tracks"]),
+                         "coasting": sum(t["coasting"] for t in r["tracks"]), "split": len(r["track_split"]),
+                         "tracked_frac": round(float(r["tracked_anomaly"].mean()), 3), "tracking_ms": r["tracking_ms"]})
         print(json.dumps(line, separators=(",", ":")), flush=True)
         if args.show or args.debug_video:
             panel = (color_difference.debug_panel if args.color else debug_panel)(frame, r["sidewalk"], r)
+            if "tracks" in r:  # on the bottom-right tile, which is the frame at half size
+                h, w = frame.shape[:2]
+                draw_tracks(panel, r, (w // 2) / w, (w // 2, h // 2))
             if args.debug_video:
                 if writer is None:
                     size = (panel.shape[1], panel.shape[0])

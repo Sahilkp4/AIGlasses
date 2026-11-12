@@ -9,7 +9,8 @@ Scores (sidewalk pixels at 960x540, ground truth from eval_sidewalk.gt_mask):
              drops count; frames before the first result score as an empty prediction)
   processed  each processed frame against its own labels (no lag)
   baseline   raw model argmax sidewalk (as in eval_sidewalk.py) on the same processed frames, computed offline
-The prediction scored is the focus area after the Sobel and colour difference checks, which are on by default. Also:
+The prediction scored is the focus area after the Sobel and colour difference checks and feature tracking, which
+are on by default (--no-tracking scores the checks alone). Also:
 focus-area coverage of the near-field sidewalk, latency per pipeline stage, CPU time, peak memory and drops.
 
   python3 simulate_sidewalk.py --limit 60      # smoke test
@@ -21,6 +22,7 @@ focus-area coverage of the near-field sidewalk, latency per pipeline stage, CPU 
 
 The overlay video colours SegFormer's regions (focus area, other sidewalk, holes in the focus area), each check's
 rejections and their combinations, split by sidewalk versus hole, and outlines the labelled sidewalk; see the legend.
+With tracking on it also draws that frame's tracked boxes: yellow tentative, red guaranteed, labelled id:streak.
 """
 import argparse
 import csv
@@ -37,7 +39,8 @@ import torch
 from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
 
 from eval_sidewalk import EVAL_H, EVAL_W, MODEL, gt_mask
-from sidewalk_system import SidewalkNavigator, add_color_args, color_check
+from feature_tracking import GUARANTEED_COLOR, TENTATIVE_COLOR, add_tracking_args, draw_tracks, motion_text, tracker
+from sidewalk_system import SidewalkNavigator, add_color_args, camera_frame, color_check
 from sobel_texture import THRESHOLD, WINDOW, SobelTexture, fill_holes
 
 SRC = "data/dataset_flip"
@@ -91,7 +94,7 @@ def run_live(nav, frames, fps):
             time.sleep(max(0.0, (idx + 1) / fps - cam.now()))
             continue
         start = cam.now()
-        r = nav.process(frames[idx])
+        r = nav.process(frames[idx], idx)
         r["frame"], r["start"], r["end"] = idx, start, cam.now()
         r["mask"] = np.packbits(r.get("refined_focus", r["focus"]))
         r["focus_mask"], r["sidewalk_mask"] = np.packbits(r["focus"]), np.packbits(r["sidewalk"])
@@ -99,7 +102,10 @@ def run_live(nav, frames, fps):
             r["rejected"] = np.packbits(r["anomaly"])
         if "color_anomaly" in r:
             r["color_rejected"] = np.packbits(r["color_anomaly"])
-        for k in ("focus", "sidewalk", "anomaly", "color_anomaly", "refined_sidewalk", "refined_focus"):
+        if "tracked_anomaly" in r:
+            r["tracked_rejected"] = np.packbits(r["tracked_anomaly"])
+        for k in ("focus", "sidewalk", "anomaly", "color_anomaly", "tracked_anomaly", "refined_sidewalk",
+                  "refined_focus"):
             r.pop(k, None)
         results.append(r)
         last = idx
@@ -205,6 +211,9 @@ def render(frames, gts, live, results, fps, path, walk, color_name):
     if has_sobel and has_color:
         items.append((f"hole + Sobel + {color_name}", HOLE_BOTH_COLOR))
     items.append(("labelled sidewalk (outline)", LABEL_COLOR))
+    if "tracks" in results[0]:
+        items += [("tracked box, tentative (id:streak)", TENTATIVE_COLOR),
+                  ("tracked box, guaranteed (id:streak)", GUARANTEED_COLOR)]
     header_h = legend(np.zeros((1, EVAL_W, 3), np.uint8), items, 64, draw=False) + 10
     writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"avc1"), fps, (EVAL_W, EVAL_H))
     for i, img in enumerate(frames):
@@ -230,6 +239,12 @@ def render(frames, gts, live, results, fps, path, walk, color_name):
             line1 = (f"focus {100 * focus.mean():.1f}% of frame   Sobel {int(sobel.sum())} px   {color_name} "
                      f"{int(color.sum())} px, {n_obj} objects   latency {r['latency_ms']:.0f} ms")
             line2 = f"from frame {r['frame'] + 1}  age {age:.0f} ms"
+            if "tracks" in r:  # this frame's tracked boxes only (no coasting boxes)
+                draw_tracks(out, r, current_only=True, width=2)
+                cur = [t for t in r["tracks"] if not t["coasting"]]
+                n_g = sum(t["state"] == "guaranteed" for t in cur)
+                line2 += f"   boxes {len(cur) - n_g} tentative, {n_g} guaranteed"
+                line2 += f"   motion {motion_text(r)}"
         else:
             line1, line2 = "waiting for first result", ""
         contours, _ = cv2.findContours(gt.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -331,6 +346,10 @@ def main():
     ap.add_argument("--sobel-window", type=int, nargs=2, default=WINDOW, metavar=("W", "H"), help="sliding-window width and height in pixels, odd")
     ap.add_argument("--sobel-threshold", type=float, default=THRESHOLD, help="spreads above normal texture before a pixel is rejected")
     add_color_args(ap)
+    add_tracking_args(ap)
+    ap.add_argument("--live-resize", action="store_true",
+                    help="decode frames at full resolution and shrink them with sidewalk_system.camera_frame, as the live "
+                         "loop does, instead of the faster reduced JPEG decode")
     args = ap.parse_args()
     color_name = "colour"
     os.makedirs(OUT, exist_ok=True)
@@ -342,15 +361,21 @@ def main():
     walks = {k: v for k, v in {"A": range(0, N_ORIGINAL), "B": range(N_ORIGINAL, len(paths))}.items()
              if k in args.walks.upper()}
     nav = SidewalkNavigator(args.device, SobelTexture(args.sobel_window, args.sobel_threshold) if args.sobel else None,
-                            color_check(args))
+                            color_check(args), tracker(args))
 
     summaries, all_rows = {}, []
     for name, rng in walks.items():
         idx = list(rng)[: args.limit or None]
         print(f"Walk {name}: preloading {len(idx)} frames at {EVAL_W}x{EVAL_H}...")
-        frames = [cv2.resize(cv2.imread(paths[i], cv2.IMREAD_REDUCED_COLOR_4), (EVAL_W, EVAL_H)) for i in idx]
+        if args.live_resize:
+            frames = [camera_frame(cv2.imread(paths[i])) for i in idx]
+            assert frames[0].shape[:2] == (EVAL_H, EVAL_W), frames[0].shape
+        else:
+            frames = [cv2.resize(cv2.imread(paths[i], cv2.IMREAD_REDUCED_COLOR_4), (EVAL_W, EVAL_H)) for i in idx]
         for img in frames[:WARMUP]:
             nav.process(img)
+        if nav.tracker:  # each walk is a fresh session; warmup frames must not leave tracks behind
+            nav.tracker.reset()
         print(f"  playing {len(frames) / fps:.1f}s at {fps:g} FPS on {args.device}...")
         cpu0 = time.process_time()
         results = run_live(nav, frames, fps)
